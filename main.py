@@ -1,4 +1,6 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_atari_envpoolpy
+import csv
+import json
 import os
 import random
 import shutil
@@ -81,14 +83,16 @@ class Args:
     """run deterministic eval about this often; <=0 disables eval checkpointing"""
     eval_episodes: int = 8
     """number of full episodes/tracks for each intermittent eval"""
-    eval_num_envs: int = 8
-    """number of parallel envs used for intermittent eval"""
+    eval_num_envs: int = 32
+    """number of parallel envs used for intermittent eval; keep this reasonably large so eval is batched"""
     eval_seed_offset: int = 10_000
     """eval env seed is seed + eval_seed_offset + global_step"""
     final_eval_episodes: int = 300
     """number of full tracks for the final deterministic eval"""
-    final_eval_num_envs: int = 16
-    """number of parallel envs used for final deterministic eval"""
+    final_eval_num_envs: int = 64
+    """number of parallel envs used for final deterministic eval; use a decent batch so 300 tracks does not crawl"""
+    final_eval_results_path: str = "checkpoints/carracing_final_eval_results.json"
+    """where to write final 300-track eval mean/std/min/max and all returns"""
     action_history_len: int = 4
     """number of previous continuous actions to concatenate with visual features"""
     actor_log_std_init: float = -1.0
@@ -759,6 +763,42 @@ def save_checkpoint(
     )
 
 
+def write_final_eval_results(path: str, final_eval_stats: dict, args: Args, run_name: str, global_step: int):
+    """Write final evaluation results to JSON and a companion CSV of per-track returns."""
+    save_dir = os.path.dirname(path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    payload = {
+        "run_name": run_name,
+        "global_step": int(global_step),
+        "env_id": args.env_id,
+        "seed": int(args.seed),
+        "num_episodes": int(final_eval_stats["num_episodes"]),
+        "num_envs": int(final_eval_stats["num_envs"]),
+        "eval_seed": int(final_eval_stats["eval_seed"]),
+        "checkpoint_path": final_eval_stats.get("checkpoint_path"),
+        "mean_return": float(final_eval_stats["mean_return"]),
+        "std_return": float(final_eval_stats["std_return"]),
+        "min_return": float(final_eval_stats["min_return"]),
+        "max_return": float(final_eval_stats["max_return"]),
+        "returns": [float(x) for x in final_eval_stats["returns"]],
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    root, _ = os.path.splitext(path)
+    csv_path = f"{root}.returns.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["episode_index", "return"])
+        for i, ret in enumerate(payload["returns"]):
+            writer.writerow([i, ret])
+
+    return os.path.abspath(path), os.path.abspath(csv_path)
+
+
 @torch.no_grad()
 def evaluate_deterministic_policy(
     agent: ConvSimpleAgent,
@@ -1182,16 +1222,20 @@ if __name__ == "__main__":
     else:
         print("No best eval checkpoint existed; using final online agent for final eval.")
 
+    final_eval_seed = args.seed + args.eval_seed_offset + 123_456
     final_eval_mean, final_eval_std, final_eval_returns = evaluate_deterministic_policy(
         agent,
         args,
         device,
         num_episodes=args.final_eval_episodes,
         num_envs=args.final_eval_num_envs,
-        seed=args.seed + args.eval_seed_offset + 123_456,
+        seed=final_eval_seed,
     )
     final_eval_stats = {
         "num_episodes": args.final_eval_episodes,
+        "num_envs": args.final_eval_num_envs,
+        "eval_seed": final_eval_seed,
+        "checkpoint_path": os.path.abspath(best_save_path) if best_eval_returns is not None and os.path.exists(best_save_path) else None,
         "mean_return": final_eval_mean,
         "std_return": final_eval_std,
         "min_return": float(np.min(final_eval_returns)) if final_eval_returns else float("nan"),
@@ -1200,10 +1244,23 @@ if __name__ == "__main__":
     }
     print(
         f"FINAL_EVAL episodes={args.final_eval_episodes}, "
+        f"num_envs={args.final_eval_num_envs}, "
         f"mean_return={final_eval_mean:.3f}, std_return={final_eval_std:.3f}, "
         f"min_return={final_eval_stats['min_return']:.3f}, "
         f"max_return={final_eval_stats['max_return']:.3f}"
     )
+    final_json_path, final_csv_path = write_final_eval_results(
+        args.final_eval_results_path,
+        final_eval_stats,
+        args,
+        run_name,
+        global_step,
+    )
+    print(f"Wrote final eval JSON summary to: {final_json_path}")
+    print(f"Wrote final eval per-track returns CSV to: {final_csv_path}")
+
+    writer.add_text("final_eval/results_json_path", final_json_path, global_step)
+    writer.add_text("final_eval/returns_csv_path", final_csv_path, global_step)
     writer.add_scalar("final_eval/mean_return", final_eval_mean, global_step)
     writer.add_scalar("final_eval/std_return", final_eval_std, global_step)
     writer.add_scalar("final_eval/min_return", final_eval_stats["min_return"], global_step)
