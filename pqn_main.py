@@ -24,6 +24,7 @@
 
 import os
 import random
+import shutil
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -112,9 +113,19 @@ class Args:
     weight_decay: float = 1e-5
     """AdamW/SGD weight decay"""
 
-    # Checkpointing.
+    # Evaluation / checkpointing.
+    eval_interval_timesteps: int = 2_000_000
+    """run deterministic eval about this often; <=0 disables eval checkpointing"""
+    eval_episodes: int = 8
+    """number of full episodes per eval run"""
+    eval_num_envs: int = 8
+    """number of parallel envs for eval"""
+    eval_seed_offset: int = 10_000
+    """eval env seed is seed + eval_seed_offset"""
     save_path: str = "checkpoints/carracing_pqn_discrete_seed1.agent.pt"
-    """where to save the final checkpoint"""
+    """where to save the best checkpoint at the end"""
+    best_save_path: str | None = None
+    """optional path for the rolling best checkpoint; default is save_path with .best before extension"""
 
     # Runtime-filled fields.
     batch_size: int = 0
@@ -452,7 +463,7 @@ class CarRacingPQNQNetwork(nn.Module):
       [B, 9] Q-values, one per discrete action.
     """
 
-    def __init__(self, envs, hidden_dim=1024, activation="relu"):
+    def __init__(self, envs, hidden_dim=1024, activation="gelu"):
         super().__init__()
 
         obs_shape = envs.single_observation_space.shape
@@ -488,7 +499,7 @@ class CarRacingPQNQNetwork(nn.Module):
         self.trunk_ln = nn.LayerNorm(hidden_dim)
 
         if activation.lower() == "relu":
-            self.act = nn.ReLU(inplace=True)
+            self.act = nn.ReLU()
         elif activation.lower() == "silu":
             self.act = nn.SiLU()
         elif activation.lower() == "gelu":
@@ -564,6 +575,154 @@ def make_optimizer(args: Args, q_network: nn.Module):
     raise ValueError(f"Unknown optimizer: {args.optimizer}. Supported: AdamW, Adam, SGD")
 
 
+
+def default_best_save_path(save_path: str) -> str:
+    """Return a path like foo.best.pt for rolling best-eval checkpoints."""
+    root, ext = os.path.splitext(save_path)
+    if ext:
+        return f"{root}.best{ext}"
+    return f"{save_path}.best.pt"
+
+
+def save_checkpoint(
+    path: str,
+    q_network: nn.Module,
+    optimizer: optim.Optimizer,
+    args: Args,
+    global_step: int,
+    run_name: str,
+    *,
+    best_eval_return: float | None,
+    eval_returns: list[float] | None,
+    is_best: bool,
+):
+    """Save all information needed to reload/evaluate the discrete PQN agent."""
+    save_dir = os.path.dirname(path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    action_table = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [-1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [-1.0, args.light_gas, 0.0],
+            [1.0, args.light_gas, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    torch.save(
+        {
+            "q_network_state_dict": q_network.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "args": vars(args),
+            "global_step": global_step,
+            "run_name": run_name,
+            "best_eval_return": best_eval_return,
+            "eval_returns": eval_returns,
+            "is_best": is_best,
+            "action_table": action_table,
+            "observation_preprocessing": {
+                "rgb": "full 96x96 RGB, uncropped",
+                "road_mask_crop": "computed on obs[:, 0:84, :, :]",
+                "road_mask_padding": "rows outside crop are zero-padded",
+                "channels_per_frame": "full RGB + full-size road_mask",
+                "road_mask": f"gray < {args.road_threshold}",
+                "reset_noop_steps": args.reset_noop_steps,
+            },
+        },
+        path,
+    )
+
+
+def make_carracing_envs(args: Args, *, num_envs: int, seed: int):
+    """Build the exact same wrapped CarRacing env stack for train or eval."""
+    envs = envpool.make(
+        args.env_id,
+        env_type="gym",
+        num_envs=num_envs,
+        seed=seed,
+    )
+    envs = DiscreteCarRacingActionWrapper(envs, light_gas=args.light_gas)
+    envs = CarRacingFrameStack(
+        envs,
+        stack_size=4,
+        road_threshold=args.road_threshold,
+        reset_noop_steps=args.reset_noop_steps,
+    )
+    envs = RecordEpisodeStatistics(envs)
+    return envs
+
+
+@torch.no_grad()
+def evaluate_greedy_policy(
+    q_network: nn.Module,
+    args: Args,
+    device: torch.device,
+    *,
+    global_step: int,
+):
+    """
+    Very occasional deterministic eval.
+
+    The agent uses argmax_a Q(s,a), i.e. no epsilon exploration.  This is the
+    number you care about when deciding which checkpoint is best.
+    """
+    if args.eval_episodes <= 0:
+        return float("nan"), []
+
+    eval_num_envs = max(1, min(args.eval_num_envs, args.eval_episodes))
+    eval_seed = args.seed + args.eval_seed_offset + int(global_step)
+    eval_envs = make_carracing_envs(args, num_envs=eval_num_envs, seed=eval_seed)
+
+    was_training = q_network.training
+    q_network.eval()
+
+    reset_out = eval_envs.reset()
+    if isinstance(reset_out, tuple):
+        obs_np, _ = reset_out
+    else:
+        obs_np = reset_out
+
+    obs = torch.as_tensor(obs_np, dtype=torch.float32, device=device)
+    returns: list[float] = []
+
+    while len(returns) < args.eval_episodes:
+        q_values = q_network(obs)
+        action = torch.argmax(q_values, dim=1)
+        step_out = eval_envs.step(action.cpu().numpy())
+
+        if len(step_out) == 5:
+            next_obs_np, reward, terminated, truncated, info = step_out
+            done_np = np.logical_or(terminated, truncated)
+        elif len(step_out) == 4:
+            next_obs_np, reward, done_np, info = step_out
+        else:
+            raise RuntimeError(f"Expected env.step() to return 4 or 5 values, got {len(step_out)}")
+
+        for idx, done_flag in enumerate(done_np):
+            if done_flag:
+                returns.append(float(info["r"][idx]))
+                if len(returns) >= args.eval_episodes:
+                    break
+
+        obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+
+    eval_envs.close()
+    if was_training:
+        q_network.train()
+
+    returns = returns[: args.eval_episodes]
+    return float(np.mean(returns)), returns
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -613,20 +772,7 @@ if __name__ == "__main__":
 
     # Env setup. Keep your CarRacing EnvPool setup, but map discrete action IDs
     # to continuous controls before stepping the actual environment.
-    envs = envpool.make(
-        args.env_id,
-        env_type="gym",
-        num_envs=args.num_envs,
-        seed=args.seed,
-    )
-    envs = DiscreteCarRacingActionWrapper(envs, light_gas=args.light_gas)
-    envs = CarRacingFrameStack(
-        envs,
-        stack_size=4,
-        road_threshold=args.road_threshold,
-        reset_noop_steps=args.reset_noop_steps,
-    )
-    envs = RecordEpisodeStatistics(envs)
+    envs = make_carracing_envs(args, num_envs=args.num_envs, seed=args.seed)
 
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "PQN requires a discrete action space"
     print(
@@ -666,6 +812,11 @@ if __name__ == "__main__":
         next_obs = reset_out
     next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
     next_done = torch.zeros(args.num_envs, dtype=torch.float32, device=device)
+
+    best_save_path = args.best_save_path or default_best_save_path(args.save_path)
+    best_eval_return = -float("inf")
+    best_eval_returns: list[float] | None = None
+    last_eval_step = 0
 
     for iteration in range(1, args.num_iterations + 1):
         if args.anneal_lr:
@@ -790,46 +941,76 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", sps, global_step)
         print(f"SPS: {sps}, epsilon={epsilon_now:.4f}, td_loss={float(np.mean(losses)):.6f}")
 
-    save_dir = os.path.dirname(args.save_path)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
+        should_eval = (
+            args.eval_interval_timesteps > 0
+            and (global_step - last_eval_step) >= args.eval_interval_timesteps
+        )
+        if should_eval:
+            last_eval_step = global_step
+            eval_mean_return, eval_returns = evaluate_greedy_policy(
+                q_network,
+                args,
+                device,
+                global_step=global_step,
+            )
+            print(
+                f"EVAL global_step={global_step}, "
+                f"mean_return={eval_mean_return:.3f}, "
+                f"returns={np.array(eval_returns, dtype=np.float32)}"
+            )
+            writer.add_scalar("eval/mean_return", eval_mean_return, global_step)
+            writer.add_scalar("eval/min_return", float(np.min(eval_returns)), global_step)
+            writer.add_scalar("eval/max_return", float(np.max(eval_returns)), global_step)
 
-    torch.save(
-        {
-            "q_network_state_dict": q_network.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "args": vars(args),
-            "global_step": global_step,
-            "run_name": run_name,
-            "action_table": np.array(
-                [
-                    [0.0, 0.0, 0.0],
-                    [-1.0, 0.0, 0.0],
-                    [1.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0],
-                    [0.0, 0.0, 1.0],
-                    [-1.0, 1.0, 0.0],
-                    [1.0, 1.0, 0.0],
-                    [-1.0, 0.0, 1.0],
-                    [1.0, 0.0, 1.0],
-                    [-1.0, args.light_gas, 0.0],
-                    [1.0, args.light_gas, 0.0],
-                ],
-                dtype=np.float32,
-            ),
-            "observation_preprocessing": {
-                "rgb": "full 96x96 RGB, uncropped",
-                "road_mask_crop": "computed on obs[:, 0:84, :, :]",
-                "road_mask_padding": "rows outside crop are zero-padded",
-                "channels_per_frame": "full RGB + full-size road_mask",
-                "road_mask": f"gray < {args.road_threshold}",
-                "reset_noop_steps": args.reset_noop_steps,
-            },
-        },
-        args.save_path,
-    )
-    abs_save_path = os.path.abspath(args.save_path)
-    print(f"Saved final checkpoint to: {abs_save_path}")
+            if eval_mean_return > best_eval_return:
+                best_eval_return = eval_mean_return
+                best_eval_returns = eval_returns
+                save_checkpoint(
+                    best_save_path,
+                    q_network,
+                    optimizer,
+                    args,
+                    global_step,
+                    run_name,
+                    best_eval_return=best_eval_return,
+                    eval_returns=best_eval_returns,
+                    is_best=True,
+                )
+                abs_best_path = os.path.abspath(best_save_path)
+                print(
+                    f"New best eval checkpoint: mean_return={best_eval_return:.3f}, "
+                    f"path={abs_best_path}"
+                )
+                writer.add_text("checkpoint/best_agent_path", abs_best_path, global_step)
+                writer.add_scalar("eval/best_mean_return", best_eval_return, global_step)
+
+    # At the end, args.save_path should contain the best-eval agent, not merely
+    # the last agent. If no eval ran, fall back to saving the final agent.
+    if best_eval_returns is not None and os.path.exists(best_save_path):
+        save_dir = os.path.dirname(args.save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        shutil.copy2(best_save_path, args.save_path)
+        abs_save_path = os.path.abspath(args.save_path)
+        print(
+            f"Copied best eval checkpoint to final save_path: {abs_save_path} "
+            f"(best_eval_return={best_eval_return:.3f})"
+        )
+    else:
+        save_checkpoint(
+            args.save_path,
+            q_network,
+            optimizer,
+            args,
+            global_step,
+            run_name,
+            best_eval_return=None,
+            eval_returns=None,
+            is_best=False,
+        )
+        abs_save_path = os.path.abspath(args.save_path)
+        print(f"No eval checkpoint existed; saved final checkpoint to: {abs_save_path}")
+
     writer.add_text("checkpoint/final_agent_path", abs_save_path, global_step)
 
     envs.close()
