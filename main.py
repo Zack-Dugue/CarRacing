@@ -1,6 +1,7 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_atari_envpoolpy
 import os
 import random
+import shutil
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -64,7 +65,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
+    ent_coef: float = 0.03
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -73,6 +74,27 @@ class Args:
     target_kl: float | None = None
     """the target KL divergence threshold"""
     save_path: str = "agent.pth"
+    """final path; after training this will contain the best eval checkpoint if eval ran"""
+    best_save_path: str | None = None
+    """optional rolling-best checkpoint path; default is save_path with .best before the extension"""
+    eval_interval_timesteps: int = 1_000_000
+    """run deterministic eval about this often; <=0 disables eval checkpointing"""
+    eval_episodes: int = 8
+    """number of full episodes/tracks for each intermittent eval"""
+    eval_num_envs: int = 8
+    """number of parallel envs used for intermittent eval"""
+    eval_seed_offset: int = 10_000
+    """eval env seed is seed + eval_seed_offset + global_step"""
+    final_eval_episodes: int = 300
+    """number of full tracks for the final deterministic eval"""
+    final_eval_num_envs: int = 16
+    """number of parallel envs used for final deterministic eval"""
+    action_history_len: int = 4
+    """number of previous continuous actions to concatenate with visual features"""
+    actor_log_std_init: float = -1.0
+    """initial value for learned log std; exp(-1) ~= 0.37"""
+    std_lr_mult: float = 10.0
+    """learning-rate multiplier for actor_log_std parameter group"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -362,7 +384,9 @@ class ConvSimpleAgent(nn.Module):
         *,
         use_muon_input=False,
         use_muon_output=False,
-        continuous_eps = .00001
+        continuous_eps=.00001,
+        action_history_len=4,
+        actor_log_std_init=-1.0,
     ):
         super().__init__()
 
@@ -371,6 +395,10 @@ class ConvSimpleAgent(nn.Module):
 
         obs_shape = envs.single_observation_space.shape
         action_dim = int(np.prod(envs.single_action_space.shape))
+        self.action_dim = action_dim
+        self.action_history_len = int(action_history_len)
+        self.action_history_dim = self.action_history_len * self.action_dim
+        model_input_dim = hidden_dim + self.action_history_dim
         self.register_buffer( "action_low",torch.tensor(envs.single_action_space.low, dtype=torch.float32))
         self.register_buffer( "action_high",torch.tensor(envs.single_action_space.high, dtype=torch.float32))
         if len(obs_shape) != 3:
@@ -446,7 +474,7 @@ class ConvSimpleAgent(nn.Module):
         self.continuous_eps = continuous_eps
 
         self.actor_mean = layer_init(
-            nn.Linear(hidden_dim, action_dim),
+            nn.Linear(model_input_dim, action_dim),
             std=0.01,
         )
 
@@ -454,10 +482,10 @@ class ConvSimpleAgent(nn.Module):
 
         # Learned state-independent log standard deviation.
         # This is much more stable for PPO than predicting log_std with a second head.
-        self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim))
+        self.actor_log_std = nn.Parameter(torch.full((1, action_dim), float(actor_log_std_init)))
 
         self.critic_out = layer_init(
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(model_input_dim, 1),
             std=1.0,
         )
 
@@ -466,7 +494,8 @@ class ConvSimpleAgent(nn.Module):
 
         print(
             f"[BetterSimpleAgent/PQN-BRN2d] obs_shape={obs_shape}, "
-            f"hidden_dim={hidden_dim}, action_dim={action_dim}"
+            f"hidden_dim={hidden_dim}, action_dim={action_dim}, "
+            f"action_history_len={self.action_history_len}, model_input_dim={model_input_dim}"
         )
         print("[BetterSimpleAgent/PQN-BRN2d] input normalization: BatchRenorm2d(C)")
         print(f"[BetterSimpleAgent/PQN-BRN2d] total parameters: {total_params:,}")
@@ -496,24 +525,55 @@ class ConvSimpleAgent(nn.Module):
         x = self._normalize_input(x)
 
         x = self.conv1(x)
-        x = self.ln1(x)
         x = self.act(x)
+        x = self.ln1(x)
 
         x = self.conv2(x)
-        x = self.ln2(x)
         x = self.act(x)
+        x = self.ln2(x)
 
         x = self.conv3(x)
-        x = self.ln3(x)
         x = self.act(x)
+        x = self.ln3(x)
+
 
         x = self.flatten(x)
 
         x = self.trunk_fc(x)
-        x = self.trunk_ln(x)
         x = self.act(x)
+        x = self.trunk_ln(x)
 
         return x
+
+    def _features_with_action_history(self, x, action_history=None):
+        """
+        Build the model input from visual features plus the previous-action stack.
+
+        action_history shape: [B, action_history_len, action_dim]. It stores the
+        actual continuous env actions from previous frames, aligned with the
+        stacked visual frames. If omitted, zeros are used.
+        """
+        features = self._features(x)
+
+        if self.action_history_len <= 0:
+            return features
+
+        batch_size = features.shape[0]
+        if action_history is None:
+            action_history = torch.zeros(
+                batch_size,
+                self.action_history_len,
+                self.action_dim,
+                dtype=features.dtype,
+                device=features.device,
+            )
+        else:
+            action_history = action_history.to(device=features.device, dtype=features.dtype)
+            action_history = action_history.reshape(batch_size, self.action_history_dim)
+            return torch.cat([features, action_history], dim=1)
+
+        action_history = action_history.reshape(batch_size, self.action_history_dim)
+        return torch.cat([features, action_history], dim=1)
 
     def get_split_params(self):
         """
@@ -570,13 +630,13 @@ class ConvSimpleAgent(nn.Module):
 
         return muon_params, adam_params
 
-    def get_value(self, x):
-        features = self._features(x)
+    def get_value(self, x, action_history=None):
+        features = self._features_with_action_history(x, action_history)
         # return self.critic_out(self.act(self.critic_ln(self.critic_fc(features))))
-        return  self.critic_out(features)
+        return self.critic_out(features)
 
-    def get_action_and_value(self, x, action=None):
-        features = self._features(x)
+    def get_action_and_value(self, x, action_history=None, action=None, deterministic: bool = False):
+        features = self._features_with_action_history(x, action_history)
 
         # actor_features = self.act(self.actor_ln(self.actor_fc(features)))
         actor_features = features
@@ -589,7 +649,12 @@ class ConvSimpleAgent(nn.Module):
         normal = Normal(actor_mean, actor_std)
 
         if action is None:
-            raw_action = normal.rsample()
+            if deterministic:
+                # Deterministic mode for evaluation/checkpoint selection.
+                # The mean lives in unconstrained pre-sigmoid action space.
+                raw_action = actor_mean
+            else:
+                raw_action = normal.rsample()
             squashed_action = torch.sigmoid(raw_action)
             squashed_action = squashed_action.clamp(
                 self.continuous_eps,
@@ -638,6 +703,147 @@ class ConvSimpleAgent(nn.Module):
 
         return env_action, log_prob, entropy, value
 
+
+def default_best_save_path(save_path: str) -> str:
+    """Return a path like foo.best.pt for rolling best-eval checkpoints."""
+    root, ext = os.path.splitext(save_path)
+    if ext:
+        return f"{root}.best{ext}"
+    return f"{save_path}.best.pt"
+
+
+def make_carracing_envs(args: Args, *, num_envs: int, seed: int):
+    """Build the same wrapped CarRacing env stack for train/eval."""
+    envs = envpool.make(
+        args.env_id,
+        env_type="gym",
+        num_envs=num_envs,
+        seed=seed,
+    )
+    envs = CarRacingFrameStack(envs, stack_size=4)
+    envs = RecordEpisodeStatistics(envs)
+    return envs
+
+
+def save_checkpoint(
+    path: str,
+    agent: nn.Module,
+    optimizer: optim.Optimizer,
+    args: Args,
+    global_step: int,
+    run_name: str,
+    *,
+    best_eval_return: float | None = None,
+    eval_returns: list[float] | None = None,
+    is_best: bool = False,
+    final_eval_stats: dict | None = None,
+):
+    """Save the agent plus eval metadata."""
+    save_dir = os.path.dirname(path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    torch.save(
+        {
+            "agent_state_dict": agent.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "args": vars(args),
+            "global_step": global_step,
+            "run_name": run_name,
+            "best_eval_return": best_eval_return,
+            "eval_returns": eval_returns,
+            "is_best": is_best,
+            "final_eval_stats": final_eval_stats,
+        },
+        path,
+    )
+
+
+@torch.no_grad()
+def evaluate_deterministic_policy(
+    agent: ConvSimpleAgent,
+    args: Args,
+    device: torch.device,
+    *,
+    num_episodes: int,
+    num_envs: int,
+    seed: int,
+):
+    """
+    Evaluate with deterministic actions: action = sigmoid(actor_mean), no sampling.
+
+    Maintains the same previous-action history as training, because that history
+    is part of the model input.
+    """
+    if num_episodes <= 0:
+        return float("nan"), float("nan"), []
+
+    eval_num_envs = max(1, min(int(num_envs), int(num_episodes)))
+    eval_envs = make_carracing_envs(args, num_envs=eval_num_envs, seed=seed)
+
+    was_training = agent.training
+    agent.eval()
+
+    reset_out = eval_envs.reset()
+    if isinstance(reset_out, tuple):
+        obs_np, _ = reset_out
+    else:
+        obs_np = reset_out
+
+    obs = torch.as_tensor(obs_np, dtype=torch.float32, device=device)
+    done = torch.zeros(eval_num_envs, dtype=torch.float32, device=device)
+    action_history = torch.zeros(
+        (eval_num_envs, args.action_history_len) + eval_envs.single_action_space.shape,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    returns: list[float] = []
+    lengths: list[int] = []
+
+    while len(returns) < num_episodes:
+        action, _, _, _ = agent.get_action_and_value(
+            obs,
+            action_history,
+            action=None,
+            deterministic=True,
+        )
+
+        step_out = eval_envs.step(action.cpu().numpy())
+        if len(step_out) == 5:
+            next_obs_np, reward, terminated, truncated, info = step_out
+            done_np = np.logical_or(terminated, truncated)
+        elif len(step_out) == 4:
+            next_obs_np, reward, done_np, info = step_out
+        else:
+            raise RuntimeError(f"Expected env.step() to return 4 or 5 values, got {len(step_out)}")
+
+        obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+        done = torch.as_tensor(done_np, dtype=torch.float32, device=device)
+
+        if args.action_history_len > 0:
+            action_history = torch.roll(action_history, shifts=-1, dims=1)
+            action_history[:, -1] = action.detach()
+            done_mask = done.bool()
+            if done_mask.any():
+                action_history[done_mask] = 0.0
+
+        for idx, done_flag in enumerate(done_np):
+            if done_flag:
+                returns.append(float(info["r"][idx]))
+                lengths.append(int(info["l"][idx]))
+                if len(returns) >= num_episodes:
+                    break
+
+    eval_envs.close()
+    if was_training:
+        agent.train()
+
+    returns = returns[:num_episodes]
+    lengths = lengths[:num_episodes]
+    return float(np.mean(returns)), float(np.std(returns)), returns
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -673,29 +879,48 @@ if __name__ == "__main__":
     print(f"the device we're using is: {device}")
 
     # env setup
-    envs = envpool.make(
-        args.env_id,
-        env_type="gym",
-        num_envs=args.num_envs,
-        # continuous=False,
-        # episodic_life=True,
-        # reward_clip=True,
-        seed=args.seed,
-    )
-    # envs.num_envs = args.num_envs
-    # envs.single_action_space = envs.action_space
-    # envs.single_observation_space = envs.observation_space
-    envs = CarRacingFrameStack(envs, stack_size=4)
-
-    envs = RecordEpisodeStatistics(envs)
+    envs = make_carracing_envs(args, num_envs=args.num_envs, seed=args.seed)
     # assert isinstance(envs.action_space, gym.spaces.Continuous), "only continuous action space is supported"
 
-    agent = ConvSimpleAgent(envs).to(device)
-    optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate, eps=1e-5, weight_decay=.00001)
+    agent = ConvSimpleAgent(
+        envs,
+        action_history_len=args.action_history_len,
+        actor_log_std_init=args.actor_log_std_init,
+    ).to(device)
+    std_params = []
+    main_params = []
+
+    for name, param in agent.named_parameters():
+        if name == "actor_log_std":
+            std_params.append(param)
+        else:
+            main_params.append(param)
+
+    optimizer = optim.AdamW(
+        [
+            {
+                "params": main_params,
+                "lr": args.learning_rate,
+                "weight_decay": 1e-5,
+            },
+            {
+                "params": std_params,
+                "lr": args.learning_rate * args.std_lr_mult,
+                "weight_decay": 0.0,
+            },
+        ],
+        eps=1e-5,
+    )
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    action_histories = torch.zeros(
+        (args.num_steps, args.num_envs, args.action_history_len) + envs.single_action_space.shape,
+        device=device,
+    )
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -712,13 +937,24 @@ if __name__ == "__main__":
         next_obs = reset_out
     next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
     next_done = torch.zeros(args.num_envs, dtype=torch.float32, device=device)
+    next_action_history = torch.zeros(
+        (args.num_envs, args.action_history_len) + envs.single_action_space.shape,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    best_save_path = args.best_save_path or default_best_save_path(args.save_path)
+    best_eval_return = -float("inf")
+    best_eval_returns: list[float] | None = None
+    last_eval_step = 0
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+            for group in optimizer.param_groups:
+                group["lr"] = frac * group["initial_lr"]
 
         if args.anneal_entropy:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
@@ -730,10 +966,11 @@ if __name__ == "__main__":
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
+            action_histories[step] = next_action_history
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value = agent.get_action_and_value(next_obs, next_action_history)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -754,12 +991,22 @@ if __name__ == "__main__":
             next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
             next_done = torch.tensor(next_done_np, dtype=torch.float32, device=device)
 
+            if args.action_history_len > 0:
+                # The next observation should receive the previous continuous actions
+                # from the stacked-frame window. If an environment reset, zero its
+                # history so the new episode does not inherit terminal actions.
+                next_action_history = torch.roll(next_action_history, shifts=-1, dims=1)
+                next_action_history[:, -1] = action.detach()
+                done_mask = next_done.bool()
+                if done_mask.any():
+                    next_action_history[done_mask] = 0.0
+
             # CarRacing has no Atari lives. Log episode stats whenever an env is done.
             for idx, d in enumerate(next_done_np):
                 if d:
                     episodic_return = float(info["r"][idx])
                     episodic_length = int(info["l"][idx])
-                    print(f"global_step={global_step}, episodic_return={episodic_return}")
+                    print(f"global_step={global_step}, episodic_return={episodic_return}, std={torch.exp(agent.actor_log_std.data)}")
                     avg_returns.append(episodic_return)
                     writer.add_scalar("charts/episodic_return", episodic_return, global_step)
                     writer.add_scalar("charts/avg_episodic_return", float(np.average(avg_returns)), global_step)
@@ -767,7 +1014,7 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(next_obs, next_action_history).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -785,6 +1032,9 @@ if __name__ == "__main__":
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_action_histories = action_histories.reshape(
+            (-1, args.action_history_len) + envs.single_action_space.shape
+        )
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -798,7 +1048,11 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    b_obs[mb_inds],
+                    b_action_histories[mb_inds],
+                    b_actions[mb_inds],
+                )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -872,22 +1126,108 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
+        should_eval = (
+            args.eval_interval_timesteps > 0
+            and (global_step - last_eval_step) >= args.eval_interval_timesteps
+        )
+        if should_eval:
+            last_eval_step = global_step
+            eval_seed = args.seed + args.eval_seed_offset + int(global_step)
+            eval_mean_return, eval_std_return, eval_returns = evaluate_deterministic_policy(
+                agent,
+                args,
+                device,
+                num_episodes=args.eval_episodes,
+                num_envs=args.eval_num_envs,
+                seed=eval_seed,
+            )
+            print(
+                f"EVAL global_step={global_step}, "
+                f"mean_return={eval_mean_return:.3f}, "
+                f"std_return={eval_std_return:.3f}, "
+                f"returns={np.array(eval_returns, dtype=np.float32)}"
+            )
+            writer.add_scalar("eval/mean_return", eval_mean_return, global_step)
+            writer.add_scalar("eval/std_return", eval_std_return, global_step)
+            writer.add_scalar("eval/min_return", float(np.min(eval_returns)), global_step)
+            writer.add_scalar("eval/max_return", float(np.max(eval_returns)), global_step)
+
+            if eval_mean_return > best_eval_return:
+                best_eval_return = eval_mean_return
+                best_eval_returns = eval_returns
+                save_checkpoint(
+                    best_save_path,
+                    agent,
+                    optimizer,
+                    args,
+                    global_step,
+                    run_name,
+                    best_eval_return=best_eval_return,
+                    eval_returns=best_eval_returns,
+                    is_best=True,
+                )
+                abs_best_path = os.path.abspath(best_save_path)
+                print(
+                    f"New best eval checkpoint: mean_return={best_eval_return:.3f}, "
+                    f"path={abs_best_path}"
+                )
+                writer.add_text("checkpoint/best_agent_path", abs_best_path, global_step)
+                writer.add_scalar("eval/best_mean_return", best_eval_return, global_step)
+
+    # If we have a best eval checkpoint, load it before the final 300-track eval.
+    if best_eval_returns is not None and os.path.exists(best_save_path):
+        checkpoint = torch.load(best_save_path, map_location=device)
+        agent.load_state_dict(checkpoint["agent_state_dict"])
+        print(f"Loaded best checkpoint for final eval: {os.path.abspath(best_save_path)}")
+    else:
+        print("No best eval checkpoint existed; using final online agent for final eval.")
+
+    final_eval_mean, final_eval_std, final_eval_returns = evaluate_deterministic_policy(
+        agent,
+        args,
+        device,
+        num_episodes=args.final_eval_episodes,
+        num_envs=args.final_eval_num_envs,
+        seed=args.seed + args.eval_seed_offset + 123_456,
+    )
+    final_eval_stats = {
+        "num_episodes": args.final_eval_episodes,
+        "mean_return": final_eval_mean,
+        "std_return": final_eval_std,
+        "min_return": float(np.min(final_eval_returns)) if final_eval_returns else float("nan"),
+        "max_return": float(np.max(final_eval_returns)) if final_eval_returns else float("nan"),
+        "returns": final_eval_returns,
+    }
+    print(
+        f"FINAL_EVAL episodes={args.final_eval_episodes}, "
+        f"mean_return={final_eval_mean:.3f}, std_return={final_eval_std:.3f}, "
+        f"min_return={final_eval_stats['min_return']:.3f}, "
+        f"max_return={final_eval_stats['max_return']:.3f}"
+    )
+    writer.add_scalar("final_eval/mean_return", final_eval_mean, global_step)
+    writer.add_scalar("final_eval/std_return", final_eval_std, global_step)
+    writer.add_scalar("final_eval/min_return", final_eval_stats["min_return"], global_step)
+    writer.add_scalar("final_eval/max_return", final_eval_stats["max_return"], global_step)
+
     save_dir = os.path.dirname(args.save_path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
-    torch.save(
-        {
-            "agent_state_dict": agent.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "args": vars(args),
-            "global_step": global_step,
-            "run_name": run_name,
-        },
+    save_checkpoint(
         args.save_path,
+        agent,
+        optimizer,
+        args,
+        global_step,
+        run_name,
+        best_eval_return=best_eval_return if best_eval_returns is not None else None,
+        eval_returns=best_eval_returns,
+        is_best=best_eval_returns is not None,
+        final_eval_stats=final_eval_stats,
     )
-    print(f"Saved final checkpoint to: {args.save_path}")
-    writer.add_text("checkpoint/final_agent_path", args.save_path, global_step)
+    abs_save_path = os.path.abspath(args.save_path)
+    print(f"Saved final checkpoint with final eval stats to: {abs_save_path}")
+    writer.add_text("checkpoint/final_agent_path", abs_save_path, global_step)
 
     envs.close()
     writer.close()
