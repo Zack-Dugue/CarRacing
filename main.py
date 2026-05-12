@@ -26,9 +26,9 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "RacingProject"
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
@@ -527,7 +527,7 @@ if __name__ == "__main__":
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
-
+        wandb.login("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")
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -536,6 +536,7 @@ if __name__ == "__main__":
             name=run_name,
             monitor_gym=True,
             save_code=True,
+
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
