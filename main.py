@@ -30,7 +30,7 @@ class Args:
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "RacingProject"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str | None = None
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
@@ -68,7 +68,7 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
-    target_kl: float = None
+    target_kl: float | None = None
     """the target KL divergence threshold"""
     save_path: str = "agent_model.pth"
 
@@ -367,10 +367,9 @@ class ConvSimpleAgent(nn.Module):
             std=0.01,
         )
 
-        self.actor_log_std =  layer_init(
-            nn.Linear(hidden_dim, action_dim),
-            std=0,
-        )
+        # Learned state-independent log standard deviation.
+        # This is much more stable for PPO than predicting log_std with a second head.
+        self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim))
 
         self.critic_out = layer_init(
             nn.Linear(hidden_dim, 1),
@@ -474,7 +473,6 @@ class ConvSimpleAgent(nn.Module):
         if self.use_muon_output:
             muon_params.extend([
                 self.actor_mean.weight,
-                self.actor_log_std.weight,
                 self.critic_out.weight,
             ])
 
@@ -498,7 +496,7 @@ class ConvSimpleAgent(nn.Module):
 
         actor_mean = self.actor_mean(actor_features)
 
-        actor_log_std = self.actor_log_std(actor_features)
+        actor_log_std = self.actor_log_std.expand_as(actor_mean)
         actor_log_std = torch.clamp(actor_log_std, -5.0, 2.0)
         actor_std = torch.exp(actor_log_std)
 
@@ -561,7 +559,6 @@ if __name__ == "__main__":
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
-        wandb.login("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")
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -617,8 +614,13 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset()[0]).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
+    reset_out = envs.reset()
+    if isinstance(reset_out, tuple):
+        next_obs, reset_info = reset_out
+    else:
+        next_obs = reset_out
+    next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+    next_done = torch.zeros(args.num_envs, dtype=torch.float32, device=device)
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
@@ -640,17 +642,31 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, next_done, truncated, info = envs.step(action.cpu().numpy())
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+            step_out = envs.step(action.cpu().numpy())
 
-            for idx, d in enumerate(next_done):
-                if d and info["lives"][idx] == 0:
-                    print(f"global_step={global_step}, episodic_return={info['r'][idx]}")
-                    avg_returns.append(info["r"][idx])
-                    writer.add_scalar("charts/avg_episodic_return", np.average(avg_returns), global_step)
-                    writer.add_scalar("charts/episodic_return", info["r"][idx], global_step)
-                    writer.add_scalar("charts/episodic_length", info["l"][idx], global_step)
+            # Support both Gymnasium-style 5-tuples and old Gym/EnvPool-style 4-tuples.
+            if len(step_out) == 5:
+                next_obs, reward, next_terminated, next_truncated, info = step_out
+                next_done_np = np.logical_or(next_terminated, next_truncated)
+            elif len(step_out) == 4:
+                next_obs, reward, next_done_np, info = step_out
+            else:
+                raise RuntimeError(f"Expected env.step() to return 4 or 5 values, got {len(step_out)}")
+
+            rewards[step] = torch.tensor(reward, dtype=torch.float32, device=device).view(-1)
+            next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+            next_done = torch.tensor(next_done_np, dtype=torch.float32, device=device)
+
+            # CarRacing has no Atari lives. Log episode stats whenever an env is done.
+            for idx, d in enumerate(next_done_np):
+                if d:
+                    episodic_return = float(info["r"][idx])
+                    episodic_length = int(info["l"][idx])
+                    print(f"global_step={global_step}, episodic_return={episodic_return}")
+                    avg_returns.append(episodic_return)
+                    writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                    writer.add_scalar("charts/avg_episodic_return", float(np.average(avg_returns)), global_step)
+                    writer.add_scalar("charts/episodic_length", episodic_length, global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -685,7 +701,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -724,7 +740,20 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
+
+                if not torch.isfinite(loss):
+                    print("Non-finite loss detected:", loss.item())
+                    print("pg_loss:", pg_loss.item())
+                    print("v_loss:", v_loss.item())
+                    print("entropy_loss:", entropy_loss.item())
+                    raise RuntimeError("Stopping because loss became non-finite.")
+
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+
+                for name, param in agent.named_parameters():
+                    if param.grad is not None and not torch.isfinite(param.grad).all():
+                        raise RuntimeError(f"Non-finite gradient in {name}")
+
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
@@ -746,6 +775,26 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-    torch.save(agent.state_dict(), args.save_path)
+    save_dir = os.path.dirname(args.save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    torch.save(
+        {
+            "agent_state_dict": agent.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "args": vars(args),
+            "global_step": global_step,
+            "run_name": run_name,
+        },
+        args.save_path,
+    )
+    print(f"Saved final checkpoint to: {args.save_path}")
+    writer.add_text("checkpoint/final_agent_path", args.save_path, global_step)
+
     envs.close()
     writer.close()
+
+    if args.track:
+        import wandb
+        wandb.finish()
