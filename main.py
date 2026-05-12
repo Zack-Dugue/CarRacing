@@ -70,6 +70,7 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
+    save_path: str = "agent_model.pth"
 
     # to be filled in runtime
     batch_size: int = 0
@@ -78,6 +79,8 @@ class Args:
     """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
+
+
 
 class RecordEpisodeStatistics(gym.Wrapper):
     """
@@ -708,5 +711,6 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
+    torch.save(agent.state_dict(), args.save_path)
     envs.close()
     writer.close()
