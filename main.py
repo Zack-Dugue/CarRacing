@@ -95,7 +95,7 @@ class Args:
     """where to write final 300-track eval mean/std/min/max and all returns"""
     action_history_len: int = 4
     """number of previous continuous actions to concatenate with visual features"""
-    actor_log_std_init: float = -1.0
+    actor_log_std_init: float = 0
     """initial value for learned log std; exp(-1) ~= 0.37"""
     std_lr_mult: float = 10.0
     """learning-rate multiplier for actor_log_std parameter group"""
