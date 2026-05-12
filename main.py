@@ -572,7 +572,8 @@ class ConvSimpleAgent(nn.Module):
 
     def get_value(self, x):
         features = self._features(x)
-        return self.critic_out(self.act(self.critic_ln(self.critic_fc(features))))
+        # return self.critic_out(self.act(self.critic_ln(self.critic_fc(features))))
+        features = self.critic_out(features)
 
     def get_action_and_value(self, x, action=None):
         features = self._features(x)
