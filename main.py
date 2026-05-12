@@ -36,6 +36,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     anneal_entropy: bool = True
+    """anneal dat entropy"""
     # Algorithm specific arguments
     env_id: str = "CarRacing-v3"
     """the id of the environment"""
