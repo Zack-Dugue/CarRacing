@@ -992,9 +992,9 @@ if __name__ == "__main__":
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
+            lr_frac = max(0.1, frac)
             for group in optimizer.param_groups:
-                group["lr"] = frac * group["initial_lr"]
+                group["lr"] = lr_frac * group["initial_lr"]
 
         if args.anneal_entropy:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
