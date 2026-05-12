@@ -543,8 +543,8 @@ class ConvSimpleAgent(nn.Module):
         """
 
         muon_params = [
-            self.actor_fc.weight,
-            self.critic_fc.weight,
+            # self.actor_fc.weight,
+            # self.critic_fc.weight,
             self.trunk_fc.weight,
         ]
 
