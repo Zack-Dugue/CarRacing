@@ -35,6 +35,7 @@ class Args:
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
+    anneal_entropy: bool = True
     # Algorithm specific arguments
     env_id: str = "CarRacing-v3"
     """the id of the environment"""
@@ -448,7 +449,7 @@ class ConvSimpleAgent(nn.Module):
             std=0.01,
         )
 
-        self.actor_mean.bias.data = torch.Tensor([0, 0, -1])
+        self.actor_mean.bias.data = torch.Tensor([0, 0, -2])
 
         # Learned state-independent log standard deviation.
         # This is much more stable for PPO than predicting log_std with a second head.
