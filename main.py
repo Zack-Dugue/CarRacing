@@ -80,7 +80,88 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
+class CarRacingFrameStack(gym.Wrapper):
+    """
+    Frame-stack wrapper for vectorized EnvPool CarRacing.
 
+    Input observation:
+        [num_envs, 96, 96, 3]
+
+    Output observation:
+        [num_envs, 96, 96, 3 * stack_size]
+
+    This keeps the HWC layout used by EnvPool/Gymnasium, then your model's
+    _normalize_input() still converts HWC -> CHW with torch.permute.
+    """
+
+    def __init__(self, env, stack_size=4):
+        super().__init__(env)
+
+        self.num_envs = int(getattr(env, "num_envs", 1))
+        self.stack_size = int(stack_size)
+
+        base_obs_space = getattr(env, "single_observation_space", env.observation_space)
+        base_action_space = getattr(env, "single_action_space", env.action_space)
+
+        if len(base_obs_space.shape) != 3:
+            raise ValueError(
+                f"Expected image observation shape [H, W, C], got {base_obs_space.shape}"
+            )
+
+        h, w, c = base_obs_space.shape
+
+        self.single_observation_space = gym.spaces.Box(
+            low=0,
+            high=255,
+            shape=(h, w, c * self.stack_size),
+            dtype=base_obs_space.dtype,
+        )
+        self.observation_space = self.single_observation_space
+
+        self.single_action_space = base_action_space
+        self.action_space = base_action_space
+
+        self.frames = deque(maxlen=self.stack_size)
+
+    def reset(self, **kwargs):
+        out = self.env.reset(**kwargs)
+
+        if isinstance(out, tuple) and len(out) == 2:
+            obs, info = out
+            return_info = True
+        else:
+            obs = out
+            info = {}
+            return_info = False
+
+        obs = np.asarray(obs)
+
+        self.frames.clear()
+        for _ in range(self.stack_size):
+            self.frames.append(obs.copy())
+
+        stacked_obs = np.concatenate(list(self.frames), axis=-1)
+
+        if return_info:
+            return stacked_obs, info
+        return stacked_obs
+
+    def step(self, action):
+        out = self.env.step(action)
+
+        if len(out) == 5:
+            obs, reward, terminated, truncated, info = out
+            self.frames.append(np.asarray(obs).copy())
+            stacked_obs = np.concatenate(list(self.frames), axis=-1)
+            return stacked_obs, reward, terminated, truncated, info
+
+        if len(out) == 4:
+            obs, reward, done, info = out
+            self.frames.append(np.asarray(obs).copy())
+            stacked_obs = np.concatenate(list(self.frames), axis=-1)
+            return stacked_obs, reward, done, info
+
+        raise RuntimeError(f"Expected env.step() to return 4 or 5 values, got {len(out)}")
 
 class RecordEpisodeStatistics(gym.Wrapper):
     """
@@ -367,6 +448,8 @@ class ConvSimpleAgent(nn.Module):
             std=0.01,
         )
 
+        self.actor_mean.bias.data = torch.Tensor([0, 0, -1])
+
         # Learned state-independent log standard deviation.
         # This is much more stable for PPO than predicting log_std with a second head.
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim))
@@ -596,6 +679,8 @@ if __name__ == "__main__":
     # envs.num_envs = args.num_envs
     # envs.single_action_space = envs.action_space
     # envs.single_observation_space = envs.observation_space
+    envs = CarRacingFrameStack(envs, stack_size=4)
+
     envs = RecordEpisodeStatistics(envs)
     # assert isinstance(envs.action_space, gym.spaces.Continuous), "only continuous action space is supported"
 
