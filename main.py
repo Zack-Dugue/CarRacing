@@ -369,7 +369,7 @@ class ConvSimpleAgent(nn.Module):
 
         self.actor_log_std =  layer_init(
             nn.Linear(hidden_dim, action_dim),
-            std=0.01,
+            std=0,
         )
 
         self.critic_out = layer_init(
@@ -494,30 +494,64 @@ class ConvSimpleAgent(nn.Module):
     def get_action_and_value(self, x, action=None):
         features = self._features(x)
 
-        actor_feactures = self.act(self.actor_ln(self.actor_fc(features)))
-        actor_log_std = self.actor_log_std(actor_feactures)
-        actor_mean = self.actor_mean(actor_feactures)
-        normal = Normal(actor_mean, torch.exp(actor_log_std))
+        actor_features = self.act(self.actor_ln(self.actor_fc(features)))
 
-        #The action is assumed to be the environment action so
+        actor_mean = self.actor_mean(actor_features)
+
+        actor_log_std = self.actor_log_std(actor_features)
+        actor_log_std = torch.clamp(actor_log_std, -5.0, 2.0)
+        actor_std = torch.exp(actor_log_std)
+
+        normal = Normal(actor_mean, actor_std)
 
         if action is None:
-            squashed_action = normal.sample()
-            squashed_action = torch.sigmoid(squashed_action)
-            squashed_action = squashed_action.clamp(self.continuous_eps, 1 - self.continuous_eps)
+            raw_action = normal.rsample()
+            squashed_action = torch.sigmoid(raw_action)
+            squashed_action = squashed_action.clamp(
+                self.continuous_eps,
+                1.0 - self.continuous_eps,
+            )
+            env_action = squashed_action * (self.action_high - self.action_low) + self.action_low
         else:
-            # we need to undo the scaling
-            squashed_action = (action - self.action_low)/(self.action_high - self.action_low)
-            squashed_action = squashed_action.clamp(self.continuous_eps, 1 - self.continuous_eps)
+            env_action = action
 
-        raw_action = torch.logit(squashed_action, eps=self.continuous_eps)
-        log_prob = normal.log_prob(raw_action) - torch.log(squashed_action * ( 1-squashed_action) + self.continuous_eps)
+            squashed_action = (env_action - self.action_low) / (
+                    self.action_high - self.action_low
+            )
+            squashed_action = squashed_action.clamp(
+                self.continuous_eps,
+                1.0 - self.continuous_eps,
+            )
+
+            raw_action = torch.logit(squashed_action, eps=self.continuous_eps)
+
+        log_prob = normal.log_prob(raw_action)
+
+        log_prob -= torch.log(
+            squashed_action * (1.0 - squashed_action) + self.continuous_eps
+        )
+
+        log_prob -= torch.log(
+            self.action_high - self.action_low
+        )
+
         log_prob = log_prob.sum(dim=-1)
-        action = squashed_action * (self.action_high - self.action_low) + self.action_low
 
-        value = self.critic_out(self.act(self.critic_ln(self.critic_fc(features))))
+        # Better entropy proxy for the transformed action.
+        entropy = normal.entropy()
+        entropy += torch.log(
+            squashed_action * (1.0 - squashed_action) + self.continuous_eps
+        )
+        entropy += torch.log(
+            self.action_high - self.action_low
+        )
+        entropy = entropy.sum(dim=-1)
 
-        return action,log_prob, normal.entropy().sum(dim=-1), value
+        value = self.critic_out(
+            self.act(self.critic_ln(self.critic_fc(features)))
+        )
+
+        return env_action, log_prob, entropy, value
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
