@@ -38,7 +38,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "CarRacing-v3"
     """the id of the environment"""
-    total_timesteps: int = 10000000
+    total_timesteps: int = 1000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
@@ -70,7 +70,7 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float | None = None
     """the target KL divergence threshold"""
-    save_path: str = "agent_model.pth"
+    save_path: str = "agent.pth"
 
     # to be filled in runtime
     batch_size: int = 0
@@ -716,6 +716,12 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        if args.anneal_entropy:
+            frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            ent_coef = frac**(.5) * args.ent_coef
+        else:
+            ent_coef = args.ent_coef
+
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -823,7 +829,7 @@ if __name__ == "__main__":
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = pg_loss - ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
