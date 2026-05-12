@@ -666,6 +666,8 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
+    print(f"the device we're using is: {device}")
+
     # env setup
     envs = envpool.make(
         args.env_id,
