@@ -545,7 +545,7 @@ class ConvSimpleAgent(nn.Module):
 
         x = self.trunk_fc(x)
         x = self.act(x)
-        x = self.trunk_ln(x)
+        # x = self.trunk_ln(x)
 
         return x
 
