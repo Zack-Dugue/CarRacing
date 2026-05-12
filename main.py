@@ -358,7 +358,7 @@ class ConvSimpleAgent(nn.Module):
     def __init__(
         self,
         envs,
-        hidden_dim=512,
+        hidden_dim=1024,
         *,
         use_muon_input=False,
         use_muon_output=False,
@@ -438,10 +438,10 @@ class ConvSimpleAgent(nn.Module):
         self.act = nn.GELU()
 
         # ----- Separate PPO actor/value heads -----
-        self.actor_fc = layer_init(nn.Linear(hidden_dim, hidden_dim))
-        self.critic_fc = layer_init(nn.Linear(hidden_dim, hidden_dim))
-        self.actor_ln = nn.LayerNorm(hidden_dim)
-        self.critic_ln = nn.LayerNorm(hidden_dim)
+        # self.actor_fc = layer_init(nn.Linear(hidden_dim, hidden_dim))
+        # self.critic_fc = layer_init(nn.Linear(hidden_dim, hidden_dim))
+        # self.actor_ln = nn.LayerNorm(hidden_dim)
+        # self.critic_ln = nn.LayerNorm(hidden_dim)
 
         self.continuous_eps = continuous_eps
 
@@ -577,8 +577,8 @@ class ConvSimpleAgent(nn.Module):
     def get_action_and_value(self, x, action=None):
         features = self._features(x)
 
-        actor_features = self.act(self.actor_ln(self.actor_fc(features)))
-
+        # actor_features = self.act(self.actor_ln(self.actor_fc(features)))
+        actor_features = features
         actor_mean = self.actor_mean(actor_features)
 
         actor_log_std = self.actor_log_std.expand_as(actor_mean)
@@ -630,9 +630,10 @@ class ConvSimpleAgent(nn.Module):
         )
         entropy = entropy.sum(dim=-1)
 
-        value = self.critic_out(
-            self.act(self.critic_ln(self.critic_fc(features)))
-        )
+        # value = self.critic_out(
+        #     self.act(self.critic_ln(self.critic_fc(features)))
+        # )
+        value = self.critic_out(features)
 
         return env_action, log_prob, entropy, value
 
@@ -689,7 +690,7 @@ if __name__ == "__main__":
     # assert isinstance(envs.action_space, gym.spaces.Continuous), "only continuous action space is supported"
 
     agent = ConvSimpleAgent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate, eps=1e-5, weight_decay=.00001)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -720,7 +721,7 @@ if __name__ == "__main__":
 
         if args.anneal_entropy:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            ent_coef = frac**(.5) * args.ent_coef
+            ent_coef = frac**(2) * args.ent_coef
         else:
             ent_coef = args.ent_coef
 
