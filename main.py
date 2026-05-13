@@ -18,6 +18,11 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    import imageio.v2 as imageio
+except Exception:
+    imageio = None
+
 
 @dataclass
 class Args:
@@ -35,8 +40,8 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str | None = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
+    capture_video: bool = True
+    """whether to record one deterministic final-eval video at the end"""
 
     anneal_entropy: bool = True
     """anneal dat entropy"""
@@ -93,6 +98,14 @@ class Args:
     """number of parallel envs used for final deterministic eval; use a decent batch so 300 tracks does not crawl"""
     final_eval_results_path: str = "checkpoints/carracing_final_eval_results.json"
     """where to write final 300-track eval mean/std/min/max and all returns"""
+    final_video_path: str = "videos/carracing_final_eval.mp4"
+    """where to write one deterministic final-eval rollout video"""
+    final_video_fps: int = 30
+    """frames per second for the final-eval video"""
+    final_video_max_steps: int = 1001
+    """maximum number of environment steps to record in the final-eval video"""
+    final_video_seed_offset: int = 999_999
+    """video env seed is seed + eval_seed_offset + final_video_seed_offset"""
     action_history_len: int = 4
     """number of previous continuous actions to concatenate with visual features"""
     actor_log_std_init: float = 0
@@ -785,6 +798,14 @@ def write_final_eval_results(path: str, final_eval_stats: dict, args: Args, run_
         "returns": [float(x) for x in final_eval_stats["returns"]],
     }
 
+    # Optional video metadata, if a final rollout video was recorded.
+    for extra_key in ["video_path", "video_return", "video_length", "video_seed"]:
+        if extra_key in final_eval_stats:
+            value = final_eval_stats[extra_key]
+            if isinstance(value, (np.floating, np.integer)):
+                value = value.item()
+            payload[extra_key] = value
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
@@ -882,6 +903,116 @@ def evaluate_deterministic_policy(
     returns = returns[:num_episodes]
     lengths = lengths[:num_episodes]
     return float(np.mean(returns)), float(np.std(returns)), returns
+
+
+@torch.no_grad()
+def record_deterministic_video(
+    agent: ConvSimpleAgent,
+    args: Args,
+    device: torch.device,
+    *,
+    video_path: str,
+    seed: int,
+    fps: int,
+    max_steps: int,
+):
+    """
+    Record one deterministic single-environment rollout to an MP4.
+
+    This intentionally uses gymnasium.make(..., render_mode="rgb_array") instead
+    of EnvPool, because EnvPool is great for batched training/eval but awkward for
+    reliably extracting RGB frames. The observation preprocessing is kept aligned
+    with training by manually doing the same 4-frame HWC stack used by
+    CarRacingFrameStack.
+    """
+    if imageio is None:
+        raise RuntimeError(
+            "imageio is not installed/importable. Install it with: "
+            "pip install imageio imageio-ffmpeg"
+        )
+
+    save_dir = os.path.dirname(video_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    env = gym.make(args.env_id, render_mode="rgb_array")
+
+    was_training = agent.training
+    agent.eval()
+
+    reset_out = env.reset(seed=seed)
+    if isinstance(reset_out, tuple):
+        obs_np, _ = reset_out
+    else:
+        obs_np = reset_out
+
+    frame_stack = deque(maxlen=4)
+    obs_np = np.asarray(obs_np)
+    for _ in range(4):
+        frame_stack.append(obs_np.copy())
+
+    action_history = torch.zeros(
+        (1, args.action_history_len) + env.action_space.shape,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    frames = []
+    initial_frame = env.render()
+    if initial_frame is not None:
+        frames.append(np.asarray(initial_frame))
+
+    total_return = 0.0
+    length = 0
+    terminated = False
+    truncated = False
+
+    while not (terminated or truncated) and length < int(max_steps):
+        stacked_obs = np.concatenate(list(frame_stack), axis=-1)
+        obs = torch.as_tensor(stacked_obs[None, ...], dtype=torch.float32, device=device)
+
+        action, _, _, _ = agent.get_action_and_value(
+            obs,
+            action_history,
+            action=None,
+            deterministic=True,
+        )
+        action_np = action[0].detach().cpu().numpy()
+
+        step_out = env.step(action_np)
+        if len(step_out) == 5:
+            next_obs_np, reward, terminated, truncated, info = step_out
+        elif len(step_out) == 4:
+            next_obs_np, reward, done, info = step_out
+            terminated = bool(done)
+            truncated = False
+        else:
+            raise RuntimeError(f"Expected env.step() to return 4 or 5 values, got {len(step_out)}")
+
+        total_return += float(reward)
+        length += 1
+
+        rendered = env.render()
+        if rendered is not None:
+            frames.append(np.asarray(rendered))
+
+        frame_stack.append(np.asarray(next_obs_np).copy())
+
+        if args.action_history_len > 0:
+            action_history = torch.roll(action_history, shifts=-1, dims=1)
+            action_history[:, -1] = action.detach()
+
+    env.close()
+
+    if was_training:
+        agent.train()
+
+    if not frames:
+        raise RuntimeError("No frames were captured from the render environment.")
+
+    imageio.mimsave(video_path, frames, fps=int(fps))
+
+    return os.path.abspath(video_path), float(total_return), int(length)
 
 
 if __name__ == "__main__":
@@ -1249,6 +1380,32 @@ if __name__ == "__main__":
         f"min_return={final_eval_stats['min_return']:.3f}, "
         f"max_return={final_eval_stats['max_return']:.3f}"
     )
+    if args.capture_video:
+        final_video_seed = args.seed + args.eval_seed_offset + args.final_video_seed_offset
+        try:
+            video_path, video_return, video_length = record_deterministic_video(
+                agent,
+                args,
+                device,
+                video_path=args.final_video_path,
+                seed=final_video_seed,
+                fps=args.final_video_fps,
+                max_steps=args.final_video_max_steps,
+            )
+            final_eval_stats["video_path"] = video_path
+            final_eval_stats["video_return"] = video_return
+            final_eval_stats["video_length"] = video_length
+            final_eval_stats["video_seed"] = final_video_seed
+            print(
+                f"FINAL_VIDEO path={video_path}, "
+                f"return={video_return:.3f}, length={video_length}, seed={final_video_seed}"
+            )
+            writer.add_text("final_eval/video_path", video_path, global_step)
+            writer.add_scalar("final_eval/video_return", video_return, global_step)
+            writer.add_scalar("final_eval/video_length", video_length, global_step)
+        except Exception as e:
+            print(f"WARNING: final video recording failed: {repr(e)}")
+
     final_json_path, final_csv_path = write_final_eval_results(
         args.final_eval_results_path,
         final_eval_stats,
